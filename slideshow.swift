@@ -4,6 +4,7 @@
 // See https://www.boost.org/LICENSE_1_0.txt
 
 import AppKit
+import AVKit
 import Darwin
 import Foundation
 import ImageIO
@@ -20,6 +21,16 @@ private struct Options {
     var paths: [String] = []
 }
 
+private enum MediaKind {
+    case image
+    case video
+}
+
+private struct MediaItem {
+    let url: URL
+    let kind: MediaKind
+}
+
 // Print command-line help or an error, then end the process.
 private func finish(_ message: String? = nil, status: Int32 = 0) -> Never {
     if let message {
@@ -28,9 +39,10 @@ private func finish(_ message: String? = nil, status: Int32 = 0) -> Never {
     let stream = status == 0 ? stdout : stderr
     fputs("slideshow: Fullscreen slideshow for macOS.\n\n", stream)
     fputs("Usage: slideshow [OPTIONS] FILE_OR_DIR...\n\n", stream)
+    fputs("Images use the interval; AVI and MP4 videos play to their end.\n\n", stream)
     fputs("Options:\n", stream)
-    fputs("  -i --interval SECONDS    Seconds per image. (default=5)\n", stream)
-    fputs("  -t --text TEXT           Show this text on every image.\n", stream)
+    fputs("  -i --interval SECONDS    Seconds per image; videos play to their end. (default=5)\n", stream)
+    fputs("  -t --text TEXT           Show this text on every image or video.\n", stream)
     fputs("  -n --no-text             Start with both labels hidden.\n", stream)
     fputs("     --once                Stop after displaying every image once.\n", stream)
     fputs("  -v --verbose             Print images as they are displayed.\n", stream)
@@ -100,11 +112,12 @@ private func parseArguments(_ arguments: [String]) -> Options {
     return options
 }
 
-// Recursively gather supported images, ignoring unrelated and unreadable files.
-private func findImages(in paths: [String]) -> [URL] {
-    let extensions: Set<String> = ["bmp", "gif", "heic", "heif", "jpeg", "jpg", "png", "tif", "tiff", "webp"]
+// Recursively gather images and videos, ignoring unrelated and unreadable images.
+private func findMedia(in paths: [String]) -> [MediaItem] {
+    let imageExtensions: Set<String> = ["bmp", "gif", "heic", "heif", "jpeg", "jpg", "png", "tif", "tiff", "webp"]
+    let videoExtensions: Set<String> = ["avi", "mp4"]
     let fileManager = FileManager.default
-    var images: [URL] = []
+    var media: [MediaItem] = []
 
     for path in paths {
         let url = URL(fileURLWithPath: path).standardizedFileURL
@@ -123,13 +136,21 @@ private func findImages(in paths: [String]) -> [URL] {
             candidates = [url]
         }
 
-        for candidate in candidates where extensions.contains(candidate.pathExtension.lowercased()) {
-            if let image = NSImage(contentsOf: candidate), image.isValid {
-                images.append(candidate)
+        for candidate in candidates {
+            var candidateIsDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: candidate.path, isDirectory: &candidateIsDirectory),
+                  !candidateIsDirectory.boolValue else { continue }
+            let fileExtension = candidate.pathExtension.lowercased()
+            if imageExtensions.contains(fileExtension) {
+                if let image = NSImage(contentsOf: candidate), image.isValid {
+                    media.append(MediaItem(url: candidate, kind: .image))
+                }
+            } else if videoExtensions.contains(fileExtension) {
+                media.append(MediaItem(url: candidate, kind: .video))
             }
         }
     }
-    return images
+    return media
 }
 
 // Read the original capture date and time from image metadata, when available.
@@ -398,13 +419,18 @@ private final class TextOverlayView: NSView {
     }
 }
 
-// Own the fullscreen window and advance one image on each timer tick.
+// Own the fullscreen window and advance through images and videos.
 private final class Slideshow: NSObject, NSApplicationDelegate {
-    private let images: [URL]
+    private let media: [MediaItem]
     private let options: Options
     private var index = 0
     private var window: NSWindow?
     private var imageView: NSImageView?
+    private var videoView: AVPlayerView?
+    private var videoPlayer: AVPlayer?
+    private var videoStatusObservation: NSKeyValueObservation?
+    private var videoEndObserver: NSObjectProtocol?
+    private var videoFailureObserver: NSObjectProtocol?
     private var textOverlay: TextOverlayView?
     private var timer: Timer?
     private var intervalNoticeTimer: Timer?
@@ -414,9 +440,10 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
     private var cursorHidden = false
     private var paused = false
     private var interval: TimeInterval
+    private var failedVideosInRow = 0
 
-    init(images: [URL], options: Options) {
-        self.images = images
+    init(media: [MediaItem], options: Options) {
+        self.media = media
         self.options = options
         self.interval = options.interval
     }
@@ -434,16 +461,25 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
         window.backgroundColor = .black
         window.level = .screenSaver
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        let imageView = NSImageView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        let contentView = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        let imageView = NSImageView(frame: contentView.bounds)
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.autoresizingMask = [.width, .height]
-        window.contentView = imageView
-        let overlay = TextOverlayView(frame: imageView.bounds)
+        let videoView = AVPlayerView(frame: contentView.bounds)
+        videoView.autoresizingMask = [.width, .height]
+        videoView.controlsStyle = .none
+        videoView.videoGravity = .resizeAspect
+        videoView.isHidden = true
+        let overlay = TextOverlayView(frame: contentView.bounds)
+        contentView.addSubview(imageView)
+        contentView.addSubview(videoView)
         overlay.setTextVisible(!options.noText)
-        imageView.addSubview(overlay)
+        contentView.addSubview(overlay)
+        window.contentView = contentView
         textOverlay = overlay
         self.window = window
         self.imageView = imageView
+        self.videoView = videoView
 
         signal(SIGINT, SIG_IGN)
         let interruptSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
@@ -465,7 +501,7 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
                 self.advance()
             case 126, 115: // Up arrow or Home (Pos1)
                 self.index = 0
-                self.showCurrentImage()
+                self.showCurrentItem()
             case 49 where event.modifierFlags.intersection([.command, .control, .option]).isEmpty:
                 self.togglePause()
             default:
@@ -493,59 +529,143 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         NSCursor.hide()
         cursorHidden = true
-        showCurrentImage()
+        showCurrentItem()
     }
 
     // Release the local keyboard monitor and restore the cursor on exit.
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
         intervalNoticeTimer?.invalidate()
+        stopVideo()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         interruptSource?.cancel()
         if cursorHidden { NSCursor.unhide() }
     }
 
-    // Show the current image at its aspect ratio against the black background.
-    private func displayCurrentImage() {
-        let image = NSImage(contentsOf: images[index])
-        imageView?.image = image
-        if let image, let imageView, image.size.width > 0, image.size.height > 0 {
-            let bounds = imageView.bounds
-            let scale = min(bounds.width / image.size.width, bounds.height / image.size.height)
-            let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
-            textOverlay?.frame = NSRect(x: (bounds.width - size.width) / 2,
-                                        y: (bounds.height - size.height) / 2,
-                                        width: size.width, height: size.height)
+    // Fit the overlay to the visible image or video, including letterboxing.
+    private func setOverlayFrame(for size: NSSize) {
+        guard let bounds = window?.contentView?.bounds else { return }
+        guard size.width > 0, size.height > 0 else {
+            textOverlay?.frame = bounds
+            return
         }
-        let url = images[index]
+        let scale = min(bounds.width / size.width, bounds.height / size.height)
+        let fitted = NSSize(width: size.width * scale, height: size.height * scale)
+        textOverlay?.frame = NSRect(x: (bounds.width - fitted.width) / 2,
+                                    y: (bounds.height - fitted.height) / 2,
+                                    width: fitted.width, height: fitted.height)
+    }
+
+    // Update the caption and picture information for the current item.
+    private func updateText(for item: MediaItem) {
+        let url = item.url
         let directory = url.deletingLastPathComponent().lastPathComponent
         if let textOverlay {
             let dateTime: String
-            if let cached = dateTimeCache[url] {
+            if item.kind == .video {
+                dateTime = ""
+            } else if let cached = dateTimeCache[url] {
                 dateTime = cached
             } else {
                 dateTime = captureDateTime(for: url) ?? ""
                 dateTimeCache[url] = dateTime
             }
-            var details = ["\(index + 1)/\(images.count)", url.lastPathComponent]
+            var details = ["\(index + 1)/\(media.count)", url.lastPathComponent]
             if !dateTime.isEmpty { details.append(dateTime) }
             textOverlay.update(caption: options.text ?? directory.replacingOccurrences(of: "_", with: " "),
                                details: details)
         }
-        if options.verbose { fputs("\(images[index].path)\n", stderr) }
     }
 
-    // Show the image and give it a full interval after keyboard navigation.
-    private func showCurrentImage() {
-        displayCurrentImage()
-        scheduleTimer()
+    // Show an image for the interval or play a video through to its end.
+    private func showCurrentItem() {
+        timer?.invalidate()
+        timer = nil
+        stopVideo()
+        let item = media[index]
+        updateText(for: item)
+        if options.verbose { fputs("\(item.url.path)\n", stderr) }
+
+        switch item.kind {
+        case .image:
+            failedVideosInRow = 0
+            let image = NSImage(contentsOf: item.url)
+            imageView?.image = image
+            imageView?.isHidden = false
+            videoView?.isHidden = true
+            setOverlayFrame(for: image?.size ?? .zero)
+            scheduleTimer()
+        case .video:
+            imageView?.image = nil
+            imageView?.isHidden = true
+            videoView?.isHidden = false
+            setOverlayFrame(for: .zero)
+            playVideo(at: item.url)
+        }
     }
 
-    // Give the current slide a fresh interval unless playback is paused.
+    // Stop observing and playing the previous video before changing items.
+    private func stopVideo() {
+        videoStatusObservation?.invalidate()
+        videoStatusObservation = nil
+        if let videoEndObserver { NotificationCenter.default.removeObserver(videoEndObserver) }
+        if let videoFailureObserver { NotificationCenter.default.removeObserver(videoFailureObserver) }
+        videoEndObserver = nil
+        videoFailureObserver = nil
+        videoPlayer?.pause()
+        videoView?.player = nil
+        videoPlayer = nil
+    }
+
+    // Play a local movie and advance when it ends or cannot be decoded.
+    private func playVideo(at url: URL) {
+        let playerItem = AVPlayerItem(url: url)
+        let player = AVPlayer(playerItem: playerItem)
+        videoPlayer = player
+        videoView?.player = player
+        videoEndObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.didPlayToEndTimeNotification, object: playerItem, queue: .main) { [weak self] _ in
+                guard let self, self.videoPlayer?.currentItem === playerItem else { return }
+                self.failedVideosInRow = 0
+                self.advance()
+            }
+        videoFailureObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: playerItem, queue: .main) { [weak self] _ in
+                self?.skipFailedVideo(playerItem)
+            }
+        videoStatusObservation = playerItem.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.videoPlayer?.currentItem === observedItem else { return }
+                switch observedItem.status {
+                case .readyToPlay:
+                    self.setOverlayFrame(for: observedItem.presentationSize)
+                    if !self.paused { self.videoPlayer?.play() }
+                case .failed:
+                    self.skipFailedVideo(observedItem)
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    // Skip a failed movie and stop if nothing in the sequence can be played.
+    private func skipFailedVideo(_ playerItem: AVPlayerItem) {
+        guard videoPlayer?.currentItem === playerItem else { return }
+        fputs("slideshow: cannot play video: \(media[index].url.path)\n", stderr)
+        failedVideosInRow += 1
+        if failedVideosInRow >= media.count {
+            NSApp.terminate(nil)
+        } else {
+            advance()
+        }
+    }
+
+    // Give a still image a fresh interval unless playback is paused.
     private func scheduleTimer() {
         timer?.invalidate()
         timer = nil
-        guard !paused else { return }
+        guard !paused, media[index].kind == .image else { return }
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             self?.advance()
         }
@@ -570,6 +690,8 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
     private func togglePause() {
         paused.toggle()
         textOverlay?.setPaused(paused)
+        if paused { videoPlayer?.pause() }
+        else if media[index].kind == .video { videoPlayer?.play() }
         scheduleTimer()
     }
 
@@ -578,14 +700,14 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
         if index > 0 {
             index -= 1
         } else if !options.once {
-            index = images.count - 1
+            index = media.count - 1
         }
-        showCurrentImage()
+        showCurrentItem()
     }
 
     // Advance, either wrapping to the first image or ending after the final interval.
     private func advance() {
-        if index + 1 == images.count {
+        if index + 1 == media.count {
             if options.once {
                 NSApp.terminate(nil)
                 return
@@ -594,7 +716,7 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
         } else {
             index += 1
         }
-        showCurrentImage()
+        showCurrentItem()
     }
 }
 
@@ -603,10 +725,10 @@ if NSFont(name: "Arial", size: 16) == nil {
     fputs("slideshow: Arial font is unavailable\n", stderr)
     exit(2)
 }
-private let images = findImages(in: options.paths)
-if images.isEmpty { finish("no supported images found", status: 2) }
+private let media = findMedia(in: options.paths)
+if media.isEmpty { finish("no supported images or videos found", status: 2) }
 private let app = NSApplication.shared
-private let slideshow = Slideshow(images: images, options: options)
+private let slideshow = Slideshow(media: media, options: options)
 app.setActivationPolicy(.regular)
 app.delegate = slideshow
 app.run()
