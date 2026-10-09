@@ -10,6 +10,8 @@ private struct Options {
     var interval = 5.0
     var once = false
     var verbose = false
+    var text: String?
+    var noText = false
     var paths: [String] = []
 }
 
@@ -19,8 +21,10 @@ private func finish(_ message: String? = nil, status: Int32 = 0) -> Never {
         fputs("slideshow: \(message)\n", stderr)
     }
     let stream = status == 0 ? stdout : stderr
-    fputs("Usage: slideshow.swift [-i SECONDS] [--once] [-v] FILE_OR_DIR ...\n", stream)
+    fputs("Usage: slideshow.swift [-i SECONDS] [-t TEXT | -n] [--once] [-v] FILE_OR_DIR ...\n", stream)
     fputs("  -i, --interval SECONDS   Seconds per image (default: 5)\n", stream)
+    fputs("  -t, --text TEXT          Show this text on every image\n", stream)
+    fputs("  -n, --no-text            Hide the text overlay\n", stream)
     fputs("  --once                   Stop after displaying every image once\n", stream)
     fputs("  -v, --verbose            Print images as they are displayed\n", stream)
     fputs("  -h, --help               Show this help\n", stream)
@@ -41,8 +45,23 @@ private func parseArguments(_ arguments: [String]) -> Options {
             finish()
         } else if !pathsOnly && argument == "--once" {
             options.once = true
+        } else if !pathsOnly && (argument == "-n" || argument == "--no-text") {
+            options.noText = true
         } else if !pathsOnly && (argument == "-v" || argument == "--verbose") {
             options.verbose = true
+        } else if !pathsOnly && (argument == "-t" || argument == "--text" || argument.hasPrefix("--text=")) {
+            let value: String
+            if argument.hasPrefix("--text=") {
+                value = String(argument.dropFirst("--text=".count))
+            } else {
+                index += 1
+                guard index < arguments.count else { finish("missing text", status: 2) }
+                value = arguments[index]
+            }
+            guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                finish("text must contain visible characters", status: 2)
+            }
+            options.text = value
         } else if !pathsOnly && (argument == "-i" || argument == "--interval" || argument.hasPrefix("--interval=")) {
             let value: String
             if argument.hasPrefix("--interval=") {
@@ -64,6 +83,7 @@ private func parseArguments(_ arguments: [String]) -> Options {
         index += 1
     }
 
+    if options.noText && options.text != nil { finish("--text and --no-text cannot be combined", status: 2) }
     if options.paths.isEmpty { finish("provide at least one file or directory", status: 2) }
     return options
 }
@@ -106,6 +126,71 @@ private final class SlideshowWindow: NSWindow {
     override var canBecomeKey: Bool { true }
 }
 
+// Draw centered white Arial text with a dark outline and shadow over the image.
+private final class TextOverlayView: NSView {
+    var text = "" {
+        didSet { needsDisplay = true }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard !text.isEmpty else { return }
+
+        let width = bounds.width * 0.9
+        let maxHeight = bounds.height * 0.6
+        let margin = bounds.height * 0.04
+        var size = max(16, round(min(bounds.width, bounds.height) * 0.05))
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byCharWrapping
+
+        while size > 1 {
+            let font = NSFont(name: "Arial", size: size)!
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .paragraphStyle: paragraph,
+            ]
+            let measured = (text as NSString).boundingRect(
+                with: NSSize(width: width, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: attributes)
+            if measured.height <= maxHeight { break }
+            size -= 1
+        }
+
+        let font = NSFont(name: "Arial", size: size)!
+        let whiteAttributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor(deviceWhite: 1, alpha: 1),
+            .paragraphStyle: paragraph,
+        ]
+        let measured = (text as NSString).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: whiteAttributes)
+        let rect = NSRect(x: (bounds.width - width) / 2, y: margin,
+                          width: width, height: min(ceil(measured.height), maxHeight))
+
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black
+        shadow.shadowBlurRadius = max(2, round(size / 12))
+        shadow.shadowOffset = .zero
+        let darkAttributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.black,
+            .strokeColor: NSColor.black,
+            .strokeWidth: -8,
+            .shadow: shadow,
+            .paragraphStyle: paragraph,
+        ]
+        let drawOptions: NSString.DrawingOptions = [.usesLineFragmentOrigin, .usesFontLeading]
+        NSGraphicsContext.saveGraphicsState()
+        NSAttributedString(string: text, attributes: darkAttributes).draw(with: rect, options: drawOptions)
+        NSGraphicsContext.restoreGraphicsState()
+        NSAttributedString(string: text, attributes: whiteAttributes).draw(with: rect, options: drawOptions)
+    }
+}
+
 // Own the fullscreen window and advance one image on each timer tick.
 private final class Slideshow: NSObject, NSApplicationDelegate {
     private let images: [URL]
@@ -113,6 +198,7 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
     private var index = 0
     private var window: NSWindow?
     private var imageView: NSImageView?
+    private var textOverlay: TextOverlayView?
     private var timer: Timer?
     private var keyMonitor: Any?
     private var cursorHidden = false
@@ -139,6 +225,11 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.autoresizingMask = [.width, .height]
         window.contentView = imageView
+        if !options.noText {
+            let overlay = TextOverlayView(frame: imageView.bounds)
+            imageView.addSubview(overlay)
+            textOverlay = overlay
+        }
         self.window = window
         self.imageView = imageView
 
@@ -179,7 +270,18 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
 
     // Show the current image at its aspect ratio against the black background.
     private func displayCurrentImage() {
-        imageView?.image = NSImage(contentsOf: images[index])
+        let image = NSImage(contentsOf: images[index])
+        imageView?.image = image
+        if let image, let imageView, image.size.width > 0, image.size.height > 0 {
+            let bounds = imageView.bounds
+            let scale = min(bounds.width / image.size.width, bounds.height / image.size.height)
+            let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+            textOverlay?.frame = NSRect(x: (bounds.width - size.width) / 2,
+                                        y: (bounds.height - size.height) / 2,
+                                        width: size.width, height: size.height)
+        }
+        let directory = images[index].deletingLastPathComponent().lastPathComponent
+        textOverlay?.text = options.text ?? directory.replacingOccurrences(of: "_", with: " ")
         if options.verbose { fputs("\(images[index].path)\n", stderr) }
     }
 
@@ -218,6 +320,10 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
 }
 
 private let options = parseArguments(Array(CommandLine.arguments.dropFirst()))
+if !options.noText && NSFont(name: "Arial", size: 16) == nil {
+    fputs("slideshow: Arial font is unavailable\n", stderr)
+    exit(2)
+}
 private let images = findImages(in: options.paths)
 if images.isEmpty { finish("no supported images found", status: 2) }
 private let app = NSApplication.shared
