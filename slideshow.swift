@@ -8,6 +8,7 @@ import AVKit
 import Darwin
 import Foundation
 import ImageIO
+import IOKit.pwr_mgt
 
 private let slideshowVersion = "0.1.2"
 private let slideshowVersionLine = "slideshow version \(slideshowVersion) *** Copyright (c) 2026 Johannes Overmann *** https://github.com/jovermann/macslideshow"
@@ -436,6 +437,7 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
     private var intervalNoticeTimer: Timer?
     private var keyMonitor: Any?
     private var interruptSource: DispatchSourceSignal?
+    private var displayAssertionID: IOPMAssertionID?
     private var dateTimeCache: [URL: String] = [:]
     private var cursorHidden = false
     private var paused = false
@@ -527,19 +529,40 @@ private final class Slideshow: NSObject, NSApplicationDelegate {
         NSApp.presentationOptions = [.hideDock, .hideMenuBar]
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        preventIdleDisplaySleep()
         NSCursor.hide()
         cursorHidden = true
         showCurrentItem()
     }
 
-    // Release the local keyboard monitor and restore the cursor on exit.
+    // Release system and app resources on exit.
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
         intervalNoticeTimer?.invalidate()
         stopVideo()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         interruptSource?.cancel()
+        if let displayAssertionID {
+            IOPMAssertionRelease(displayAssertionID)
+            self.displayAssertionID = nil
+        }
         if cursorHidden { NSCursor.unhide() }
+    }
+
+    // Keep the display and screen saver idle timer from interrupting the slideshow.
+    private func preventIdleDisplaySleep() {
+        let type = CFStringCreateWithCString(nil, kIOPMAssertionTypePreventUserIdleDisplaySleep,
+                                             CFStringBuiltInEncodings.UTF8.rawValue)!
+        let name = CFStringCreateWithCString(nil, "macslideshow is presenting media",
+                                             CFStringBuiltInEncodings.UTF8.rawValue)!
+        var assertionID: IOPMAssertionID = 0
+        let result = IOPMAssertionCreateWithName(type, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                                 name, &assertionID)
+        if result == kIOReturnSuccess {
+            displayAssertionID = assertionID
+        } else {
+            fputs("slideshow: could not prevent idle display sleep (\(result))\n", stderr)
+        }
     }
 
     // Fit the overlay to the visible image or video, including letterboxing.
